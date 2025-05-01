@@ -11,7 +11,8 @@ logger = logging.getLogger(__name__)
 
 
 def _ensure_non_zero(cost, beta, factor):
-    return torch.exp(-factor * (cost - beta))
+    # Combine the operations into one: -factor*cost + factor*beta
+    return torch.exp(factor * (beta - cost))
 
 
 class SpecificActionSampler:
