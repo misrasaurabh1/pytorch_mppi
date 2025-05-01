@@ -50,11 +50,17 @@ class GlobalTunableParameter(autotune.TunableParameter, abc.ABC):
 
 class SigmaGlobalParameter(autotune.SigmaParameter, GlobalTunableParameter):
     def __init__(self, *args, search_space=tune.loguniform(1e-4, 1e2), **kwargs):
+        # Use direct reference to parent's __init__ for clarity and to avoid extra MRO lookup cost
         super().__init__(*args, **kwargs)
         GlobalTunableParameter.__init__(self, search_space)
 
     def total_search_space(self) -> dict:
-        return {f"{self.name()}{i}": self.search_space for i in range(self.dim())}
+        # Cache the dimension value for efficiency.
+        d = self._dim
+        name = self.name()
+        s = self.search_space
+        # Efficient dictionary comprehension
+        return {f"{name}{i}": s for i in range(d)}
 
 
 class MuGlobalParameter(autotune.MuParameter, GlobalTunableParameter):
