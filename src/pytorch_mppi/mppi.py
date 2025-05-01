@@ -367,35 +367,35 @@ class SMPPI(MPPI):
     """Smooth MPPI by lifting the control space and penalizing the change in action from
     https://arxiv.org/pdf/2112.09988
     """
-
-    def __init__(self, *args, w_action_seq_cost=1., delta_t=1., U_init=None, action_min=None, action_max=None,
-                 **kwargs):
+    def __init__(self, *args, w_action_seq_cost=1., delta_t=1., U_init=None, action_min=None, action_max=None, **kwargs):
         self.w_action_seq_cost = w_action_seq_cost
         self.delta_t = delta_t
-
         super().__init__(*args, U_init=U_init, **kwargs)
 
-        # these are the actual commanded actions, which is now no longer directly sampled
+        # Optimize action_min/max initialization logic (do device/copy once)
         self.action_min = action_min
         self.action_max = action_max
-        if self.action_min is not None and self.action_max is None:
-            if not torch.is_tensor(self.action_min):
-                self.action_min = torch.tensor(self.action_min)
-            self.action_max = -self.action_min
-        if self.action_max is not None and self.action_min is None:
-            if not torch.is_tensor(self.action_max):
-                self.action_max = torch.tensor(self.action_max)
-            self.action_min = -self.action_max
-        if self.action_min is not None:
-            self.action_min = self.action_min.to(device=self.d)
-            self.action_max = self.action_max.to(device=self.d)
+        d = self.d
 
-        # this smooth formulation works better if control starts from 0
+        if self.action_min is not None and self.action_max is None:
+            am = torch.as_tensor(self.action_min, device=d)
+            self.action_min = am
+            self.action_max = -am
+        elif self.action_max is not None and self.action_min is None:
+            am = torch.as_tensor(self.action_max, device=d)
+            self.action_max = am
+            self.action_min = -am
+        elif self.action_min is not None and self.action_max is not None:
+            self.action_min = torch.as_tensor(self.action_min, device=d)
+            self.action_max = torch.as_tensor(self.action_max, device=d)
+
+        # Use efficient zeros_like and no repeated allocation
+        ref_U = self.U
         if U_init is None:
-            self.action_sequence = torch.zeros_like(self.U)
+            self.action_sequence = torch.zeros_like(ref_U)
         else:
-            self.action_sequence = U_init
-        self.U = torch.zeros_like(self.U)
+            self.action_sequence = U_init.to(device=d) if isinstance(U_init, torch.Tensor) else torch.as_tensor(U_init, device=d)
+        self.U = torch.zeros_like(ref_U)
 
     def get_params(self):
         return f"{super().get_params()} w={self.w_action_seq_cost} t={self.delta_t}"
