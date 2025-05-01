@@ -42,7 +42,6 @@ class MPPI():
     'Information Theoretic MPC for Model-Based Reinforcement Learning',
     based off of https://github.com/ferreirafabio/mppi_pendulum
     """
-
     def __init__(self, dynamics, running_cost, nx, noise_sigma, num_samples=100, horizon=15, device="cpu",
                  terminal_state_cost=None,
                  lambda_=1.,
@@ -58,7 +57,7 @@ class MPPI():
                  rollout_var_cost=0,
                  rollout_var_discount=0.95,
                  sample_null_action=False,
-                 specific_action_sampler: typing.Optional[SpecificActionSampler] = None,
+                 specific_action_sampler: typing.Optional["SpecificActionSampler"] = None,
                  noise_abs_cost=False):
         """
         :param dynamics: function(state, action) -> next_state (K x nx) taking in batch state (K x nx) and action (K x nu)
@@ -86,54 +85,63 @@ class MPPI():
         :param noise_abs_cost: Whether to use the absolute value of the action noise to avoid bias when all states have the same cost
         """
         self.d = device
-        self.dtype = noise_sigma.dtype
-        self.K = num_samples  # N_SAMPLES
-        self.T = horizon  # TIMESTEPS
+        dtype = noise_sigma.dtype
+        K = num_samples
+        T = horizon
 
         # dimensions of state and control
         self.nx = nx
-        self.nu = 1 if len(noise_sigma.shape) == 0 else noise_sigma.shape[0]
+        self.nu = 1 if noise_sigma.dim() == 0 else noise_sigma.shape[0]
         self.lambda_ = lambda_
 
+        dev_args = dict(dtype=dtype, device=device)
+        # Prepare noise_mu
         if noise_mu is None:
-            noise_mu = torch.zeros(self.nu, dtype=self.dtype)
+            noise_mu = torch.zeros(self.nu, **dev_args)
+        else:
+            noise_mu = noise_mu.to(**dev_args)
 
+        # Prepare u_init
         if u_init is None:
             u_init = torch.zeros_like(noise_mu)
-
+        else:
+            u_init = u_init.to(**dev_args)
+        
         # handle 1D edge case
         if self.nu == 1:
             noise_mu = noise_mu.view(-1)
-            noise_sigma = noise_sigma.view(-1, 1)
+            noise_sigma = noise_sigma.view(-1, 1).to(**dev_args)
+        else:
+            noise_sigma = noise_sigma.to(**dev_args)
+        self.noise_mu = noise_mu
+        self.noise_sigma = noise_sigma
 
         # bounds
-        self.u_min = u_min
-        self.u_max = u_max
         self.u_scale = u_scale
         self.u_per_command = u_per_command
-        # make sure if any of them is specified, both are specified
-        if self.u_max is not None and self.u_min is None:
-            if not torch.is_tensor(self.u_max):
-                self.u_max = torch.tensor(self.u_max)
-            self.u_min = -self.u_max
-        if self.u_min is not None and self.u_max is None:
-            if not torch.is_tensor(self.u_min):
-                self.u_min = torch.tensor(self.u_min)
-            self.u_max = -self.u_min
-        if self.u_min is not None:
-            self.u_min = self.u_min.to(device=self.d)
-            self.u_max = self.u_max.to(device=self.d)
+        if u_max is not None or u_min is not None:
+            # If either is not tensor, make both torch tensors and move to device
+            if u_max is not None and not torch.is_tensor(u_max):
+                u_max = torch.as_tensor(u_max, **dev_args)
+            if u_min is not None and not torch.is_tensor(u_min):
+                u_min = torch.as_tensor(u_min, **dev_args)
+            if u_max is not None and u_min is None:
+                u_min = -u_max
+            if u_min is not None and u_max is None:
+                u_max = -u_min
+            self.u_min = u_min.to(**dev_args) if u_min is not None else None
+            self.u_max = u_max.to(**dev_args) if u_max is not None else None
+        else:
+            self.u_min = None
+            self.u_max = None
 
-        self.noise_mu = noise_mu.to(self.d)
-        self.noise_sigma = noise_sigma.to(self.d)
+        # Noise distribution and inverse
         self.noise_sigma_inv = torch.inverse(self.noise_sigma)
         self.noise_dist = MultivariateNormal(self.noise_mu, covariance_matrix=self.noise_sigma)
-        # T x nu control sequence
-        self.U = U_init
-        self.u_init = u_init.to(self.d)
 
-        if self.U is None:
-            self.U = self.noise_dist.sample((self.T,))
+        # T x nu control sequence
+        self.U = U_init if U_init is not None else self.noise_dist.sample((T,))
+        self.u_init = u_init
 
         self.step_dependency = step_dependent_dynamics
         self.F = dynamics
@@ -156,6 +164,10 @@ class MPPI():
         self.omega = None
         self.states = None
         self.actions = None
+
+        self.K = K
+        self.T = T
+        self.dtype = dtype
 
     def get_params(self):
         return f"K={self.K} T={self.T} M={self.M} lambda={self.lambda_} noise_mu={self.noise_mu.cpu().numpy()} noise_sigma={self.noise_sigma.cpu().numpy()}".replace(
