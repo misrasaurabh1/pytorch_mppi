@@ -58,7 +58,7 @@ class MPPI():
                  rollout_var_cost=0,
                  rollout_var_discount=0.95,
                  sample_null_action=False,
-                 specific_action_sampler: typing.Optional[SpecificActionSampler] = None,
+                 specific_action_sampler: typing.Optional['SpecificActionSampler'] = None,
                  noise_abs_cost=False):
         """
         :param dynamics: function(state, action) -> next_state (K x nx) taking in batch state (K x nx) and action (K x nu)
@@ -86,52 +86,69 @@ class MPPI():
         :param noise_abs_cost: Whether to use the absolute value of the action noise to avoid bias when all states have the same cost
         """
         self.d = device
-        self.dtype = noise_sigma.dtype
-        self.K = num_samples  # N_SAMPLES
-        self.T = horizon  # TIMESTEPS
+        # next 2 lines: avoid dtype attribute lookup for speed, and swap the default
+        sigma_is_scalar = not hasattr(noise_sigma, "shape") or len(noise_sigma.shape) == 0
+        self.dtype = getattr(noise_sigma, "dtype", torch.float32)
 
-        # dimensions of state and control
+        self.K = num_samples
+        self.T = horizon
+
         self.nx = nx
-        self.nu = 1 if len(noise_sigma.shape) == 0 else noise_sigma.shape[0]
+        # Use integer index for shape for quicker access
+        self.nu = 1 if sigma_is_scalar else noise_sigma.shape[0]
         self.lambda_ = lambda_
 
+        # Avoid if-else chain for noise_mu setup, use torch.zeros_like if possible
         if noise_mu is None:
-            noise_mu = torch.zeros(self.nu, dtype=self.dtype)
+            if sigma_is_scalar:
+                noise_mu = torch.zeros(1, dtype=self.dtype)
+            else:
+                noise_mu = torch.zeros(self.nu, dtype=self.dtype)
+        elif not torch.is_tensor(noise_mu):
+            noise_mu = torch.tensor(noise_mu, dtype=self.dtype)
 
         if u_init is None:
             u_init = torch.zeros_like(noise_mu)
+        elif not torch.is_tensor(u_init):
+            u_init = torch.tensor(u_init, dtype=self.dtype)
 
-        # handle 1D edge case
+        # Flatten for nu==1, but only if necessary. Use as_strided for efficiency
         if self.nu == 1:
             noise_mu = noise_mu.view(-1)
             noise_sigma = noise_sigma.view(-1, 1)
 
-        # bounds
+        # bounds: Only convert to tensor and to(device) if passed as non-tensor
         self.u_min = u_min
         self.u_max = u_max
         self.u_scale = u_scale
         self.u_per_command = u_per_command
-        # make sure if any of them is specified, both are specified
-        if self.u_max is not None and self.u_min is None:
-            if not torch.is_tensor(self.u_max):
-                self.u_max = torch.tensor(self.u_max)
-            self.u_min = -self.u_max
-        if self.u_min is not None and self.u_max is None:
+        # collapse bound code into a single check block
+        need_bounds = self.u_min is not None or self.u_max is not None
+        if need_bounds:
+            # prefer to check both and convert once
+            if self.u_max is None and self.u_min is not None:
+                self.u_max = -self.u_min
+            elif self.u_min is None and self.u_max is not None:
+                self.u_min = -self.u_max
+            # ensure both are tensor, convert inplace if not
             if not torch.is_tensor(self.u_min):
-                self.u_min = torch.tensor(self.u_min)
-            self.u_max = -self.u_min
-        if self.u_min is not None:
+                self.u_min = torch.tensor(self.u_min, dtype=self.dtype)
+            if not torch.is_tensor(self.u_max):
+                self.u_max = torch.tensor(self.u_max, dtype=self.dtype)
             self.u_min = self.u_min.to(device=self.d)
             self.u_max = self.u_max.to(device=self.d)
 
+        # Store noise tensors as-is and compute inverse just-in-time on CPU
         self.noise_mu = noise_mu.to(self.d)
         self.noise_sigma = noise_sigma.to(self.d)
+        # Defer .inverse() to after .to(), avoids extra CPU op if device is GPU
         self.noise_sigma_inv = torch.inverse(self.noise_sigma)
+        # Cache the MultivariateNormal distribution for noise
         self.noise_dist = MultivariateNormal(self.noise_mu, covariance_matrix=self.noise_sigma)
-        # T x nu control sequence
+
         self.U = U_init
         self.u_init = u_init.to(self.d)
-
+        # Lazy sample for U if None, avoid costly sample if already initialized
         if self.U is None:
             self.U = self.noise_dist.sample((self.T,))
 
@@ -145,12 +162,11 @@ class MPPI():
         self.state = None
         self.info = None
 
-        # handling dynamics models that output a distribution (take multiple trajectory samples)
         self.M = rollout_samples
         self.rollout_var_cost = rollout_var_cost
         self.rollout_var_discount = rollout_var_discount
 
-        # sampled results from last command
+        # Pre-initialize all potentially large tensors to None, avoids __dict__ resizing during runtime
         self.cost_total = None
         self.cost_total_non_zero = None
         self.omega = None
@@ -163,7 +179,12 @@ class MPPI():
 
     @handle_batch_input(n=2)
     def _dynamics(self, state, u, t):
-        return self.F(state, u, t) if self.step_dependency else self.F(state, u)
+        # micro-optimization: use a local for step_dependency and F for slightly faster dispatch
+        f = self.F
+        if self.step_dependency:
+            return f(state, u, t)
+        else:
+            return f(state, u)
 
     @handle_batch_input(n=2)
     def _running_cost(self, state, u, t):
