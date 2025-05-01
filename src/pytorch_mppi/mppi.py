@@ -376,19 +376,15 @@ class SMPPI(MPPI):
         super().__init__(*args, U_init=U_init, **kwargs)
 
         # these are the actual commanded actions, which is now no longer directly sampled
-        self.action_min = action_min
-        self.action_max = action_max
-        if self.action_min is not None and self.action_max is None:
-            if not torch.is_tensor(self.action_min):
-                self.action_min = torch.tensor(self.action_min)
-            self.action_max = -self.action_min
-        if self.action_max is not None and self.action_min is None:
-            if not torch.is_tensor(self.action_max):
-                self.action_max = torch.tensor(self.action_max)
+        # optimize: only set action_min/action_max once and use device/tensor logic just once
+        if action_min is not None:
+            self.action_min = torch.as_tensor(action_min, dtype=self.U.dtype, device=self.d)
+            self.action_max = torch.as_tensor(action_max, dtype=self.U.dtype, device=self.d) if action_max is not None else -self.action_min
+        elif action_max is not None:
+            self.action_max = torch.as_tensor(action_max, dtype=self.U.dtype, device=self.d)
             self.action_min = -self.action_max
-        if self.action_min is not None:
-            self.action_min = self.action_min.to(device=self.d)
-            self.action_max = self.action_max.to(device=self.d)
+        else:
+            self.action_min = self.action_max = None
 
         # this smooth formulation works better if control starts from 0
         if U_init is None:
@@ -426,8 +422,9 @@ class SMPPI(MPPI):
         self.T = horizon
 
     def _bound_d_action(self, control):
+        # Optimize: use torch.clamp for vectorized box constraint on actions
         if self.u_max is not None:
-            return torch.max(torch.min(control, self.u_max), self.u_min)  # action
+            return torch.clamp(control, self.u_min, self.u_max)  # action
         return control
 
     def _bound_action(self, action):
